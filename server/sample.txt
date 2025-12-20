@@ -1,0 +1,332 @@
+// server.js
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
+
+const User = require("./models/Users");
+
+const app = express();
+
+// CORS so frontend can talk to this server
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  })
+);
+
+app.use(express.json());
+
+// Multer for file uploads (max 100MB)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1024 * 1024 * 100 }, // 100MB
+});
+
+// ----------------- JWT MIDDLEWARE -----------------
+const authMiddleware = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res
+      .status(401)
+      .json({ status: false, message: "No token provided" });
+  }
+
+  const token = authHeader.startsWith("Bearer ")
+    ? authHeader.split(" ")[1]
+    : authHeader;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded.username; // store username
+    next();
+  } catch (err) {
+    return res.status(401).json({ status: false, message: "Invalid token" });
+  }
+};
+
+// ----------------- GITHUB HELPERS -----------------
+const githubHeaders = {
+  Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+  Accept: "application/vnd.github+json",
+};
+
+// Create user folder in repo (username/.gitkeep)
+const createFolder = async (folderName) => {
+  try {
+    const pathInRepos = `${folderName}/.gitkeep`;
+
+    await axios.put(
+      `https://api.github.com/repos/${process.env.GITHUB_USER}/${
+        process.env.GITHUB_REPO
+      }/contents/${encodeURIComponent(pathInRepos)}`,
+      {
+        message: `Create folder ${folderName}`,
+        content: Buffer.from("").toString("base64"),
+        branch: "main",
+      },
+      {
+        headers: githubHeaders,
+      }
+    );
+
+    return true;
+  } catch (err) {
+    console.error(
+      "Error in Creating folder:",
+      err.response?.data || err.message
+    );
+    return false;
+  }
+};
+
+// ----------------- AUTH ROUTES -----------------
+app.post("/signUp", async (req, res) => {
+  const { username, password1, password2 } = req.body;
+
+  if (!username || !password1 || !password2) {
+    return res.json({ success: false, message: "Missing required fields" });
+  }
+  if (password1 !== password2) {
+    return res.json({ success: false, message: "Passwords do not match" });
+  }
+
+  try {
+    const isExists = await User.findOne({ username });
+    if (isExists) {
+      return res.json({ success: false, message: "Username already exists" });
+    }
+
+    const hashed = await bcrypt.hash(password1, 10);
+    const newUser = new User({ username, password: hashed });
+    await newUser.save();
+
+    await createFolder(username);
+
+    return res.json({ success: true, message: "User created successfully" });
+  } catch (err) {
+    console.error("Signup error:", err);
+    return res.json({ success: false, message: "Error creating user" });
+  }
+});
+
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.json({ status: false, message: "Missing required fields" });
+  }
+
+  try {
+    const user = await User.findOne({ username });
+    if (!user)
+      return res.json({ status: false, message: "Username does not exist" });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch)
+      return res.json({ status: false, message: "Incorrect password" });
+
+    const token = jwt.sign({ username }, process.env.JWT_SECRET, {
+      expiresIn: "1h",
+    });
+
+    return res.json({
+      status: true,
+      message: "Logged in successfully",
+      token,
+      username,
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    return res.status(500).json({ status: false, message: "Server error" });
+  }
+});
+
+// ----------------- FILE UPLOAD -----------------
+app.post(
+  "/add_file",
+  authMiddleware,
+  upload.single("file"),
+  async (req, res) => {
+    console.log("Adding files");
+    try {
+      const username = req.user;
+      const file = req.file;
+
+      if (!file) {
+        return res
+          .status(400)
+          .json({ status: false, message: "No file provided" });
+      }
+
+      const content = file.buffer.toString("base64");
+      const pathInRepo = `${username}/${file.originalname}`;
+
+      await axios.put(
+        `https://api.github.com/repos/${process.env.GITHUB_USER}/${
+          process.env.GITHUB_REPO
+        }/contents/${encodeURIComponent(pathInRepo)}`,
+        {
+          message: `Upload ${file.originalname} for user ${username}`,
+          content,
+          branch: "main",
+        },
+        {
+          headers: githubHeaders,
+        }
+      );
+
+      // IMPORTANT: we don't send any GitHub URL back
+      return res.json({
+        status: true,
+        message: "File uploaded successfully",
+        filename: file.originalname,
+      });
+    } catch (err) {
+      console.error("GitHub upload error:", err.response?.data || err.message);
+      return res
+        .status(500)
+        .json({ status: false, message: "Error uploading file" });
+    }
+  }
+);
+
+// ----------------- LIST FILES -----------------
+app.get("/files", authMiddleware, async (req, res) => {
+  try {
+    const username = req.user;
+
+    const githubUrl = `https://api.github.com/repos/${
+      process.env.GITHUB_USER
+    }/${process.env.GITHUB_REPO}/contents/${encodeURIComponent(username)}`;
+
+    const response = await axios.get(githubUrl, { headers: githubHeaders });
+
+    const files = Array.isArray(response.data)
+      ? response.data
+          .filter((item) => item.type === "file" && item.name !== ".gitkeep")
+          .map((item) => ({
+            name: item.name,
+            size: item.size,
+          }))
+      : [];
+
+    return res.json({ status: true, files });
+  } catch (err) {
+    if (err.response?.status === 404) {
+      // Folder not found or no files (only .gitkeep)
+      return res.json({ status: true, files: [] });
+    }
+
+    console.error(
+      "GitHub list files error:",
+      err.response?.data || err.message
+    );
+    return res
+      .status(500)
+      .json({ status: false, message: "Error fetching files" });
+  }
+});
+
+// ----------------- DOWNLOAD FILE -----------------
+app.get("/files/:filename", authMiddleware, async (req, res) => {
+  try {
+    const username = req.user;
+    const { filename } = req.params;
+
+    if (!filename || filename.includes("/")) {
+      return res
+        .status(400)
+        .json({ status: false, message: "Invalid filename" });
+    }
+
+    const pathInRepo = `${username}/${filename}`;
+    const githubUrl = `https://api.github.com/repos/${
+      process.env.GITHUB_USER
+    }/${process.env.GITHUB_REPO}/contents/${encodeURIComponent(pathInRepo)}`;
+
+    const fileRes = await axios.get(githubUrl, { headers: githubHeaders });
+
+    const fileData = fileRes.data;
+
+    // content is base64, decode to Buffer
+    const fileBuffer = Buffer.from(
+      fileData.content,
+      fileData.encoding || "base64"
+    );
+
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${fileData.name}"`
+    );
+
+    return res.send(fileBuffer);
+  } catch (err) {
+    if (err.response?.status === 404) {
+      return res.status(404).json({ status: false, message: "File not found" });
+    }
+
+    console.error("GitHub download error:", err.response?.data || err.message);
+    return res
+      .status(500)
+      .json({ status: false, message: "Error downloading file" });
+  }
+});
+
+// ----------------- DELETE FILE -----------------
+app.delete("/delete_file", authMiddleware, async (req, res) => {
+  try {
+    const username = req.user;
+    const { filename } = req.body;
+
+    if (!filename) {
+      return res
+        .status(400)
+        .json({ status: false, message: "Filename is required" });
+    }
+
+    const pathInRepo = `${username}/${filename}`;
+    const githubUrl = `https://api.github.com/repos/${
+      process.env.GITHUB_USER
+    }/${process.env.GITHUB_REPO}/contents/${encodeURIComponent(pathInRepo)}`;
+
+    // 1. Get file info (to get sha)
+    let fileRes;
+    try {
+      fileRes = await axios.get(githubUrl, { headers: githubHeaders });
+    } catch (err) {
+      if (err.response?.status === 404) {
+        return res
+          .status(404)
+          .json({ status: false, message: "File not found" });
+      }
+      throw err;
+    }
+
+    const fileSha = fileRes.data.sha;
+
+    // 2. Delete file
+    await axios.delete(githubUrl, {
+      headers: githubHeaders,
+      data: {
+        message: `Delete ${filename} for user ${username}`,
+        sha: fileSha,
+        branch: "main",
+      },
+    });
+
+    return res.json({ status: true, message: "File deleted successfully" });
+  } catch (err) {
+    console.error("GitHub delete error:", err.response?.data || err.message);
+    return res
+      .status(500)
+      .json({ status: false, message: "Error deleting file" });
+  }
+});
+
+module.exports = app;
