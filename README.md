@@ -2,7 +2,7 @@
 
 A secure web application that allows users to upload, download, and delete files with authenticated access. The system ensures user-specific file isolation and maintains data privacy while abstracting backend storage details from users.
 
-**Try it out live:** https://ourdb.onrender.com/
+**Try it out live:** [Visit the Deployed App](https://ourdb.onrender.com/)
 
 ## Features
 
